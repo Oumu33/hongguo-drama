@@ -1,7 +1,9 @@
-# 小鹅通集成补丁（合进 fork 后的仓库）
+# 集成说明（已合入，2026-10-13）
 
-> 以下三处小改动，把已写好的 `xiaoetong.js` / `xiaoetong-main.js` /
-> `XiaoetongSettings.jsx` 接进 App。改完 `npm run dist` 打包即带小鹅通登录。
+> 以下接线已在 commit `c79a76c` 合入源码（main.js / preload.js / src/components/Settings.jsx），
+> 不再是补丁文档。`npm run dist` 打包即带小鹅通登录。
+
+## 已合入内容
 
 ## 1. main.js
 
