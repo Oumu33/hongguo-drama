@@ -133,7 +133,16 @@ seriesId: parts.slice(0, 3).join(':')};
 function plainText(v) { return String(v || '').replace(/<[^>]*>/g, '').trim();}
 
 // ---------- 已购课程 / 章节（待登录后联调发现真实接口） ----------
+// 【已发现】课程目录接口（2026-10-13 逆向 H5 前端 js/6323.js 实锤）：
+//   POST https://<shop>.h5.xiaoeknow.com/xe.course.business_go.courseware_list.get/2.0.0
+//   JSON body，响应 pack "bizData"（即取响应的 bizData 字段）。
+//   课程包子课程列表：POST /xe.entity_goods.goods_package.get_goods_list/1.0.0
+//     body {resource_id, resource_type}。
+//   直接 curl 探返回空（需走它自家的 request_js 封装头），参数名与课时字段名
+//   待登录后在真实客户端抓包补全。联调方法见 docs/XIAOETONG-PLAN.md。
 // H5「我的已购」页的真实 XHR 接口。联调方法见 docs/XIAOETONG-PLAN.md。
+const COURSEWARE_LIST_API = '/xe.course.business_go.courseware_list.get/2.0.0';
+const GOODS_PACKAGE_API = '/xe.entity_goods.goods_package.get_goods_list/1.0.0';
 async function listPurchased() {
 // TODO(联调): 登录后抓包 h5.xiaoeknow.com 的已购列表接口，填到这里。
 // 候选：店铺 H5 首页「我的」→「已购」Tab 的 XHR。
