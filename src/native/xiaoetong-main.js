@@ -35,6 +35,13 @@ function registerXiaoetongIpc({ ipcMain, BrowserWindow }) {
       width: 480, height: 800, title: '小鹅通扫码登录', autoHideMenuBar: true,
       webPreferences: { contextIsolation: true, nodeIntegration: false, sandbox: true },
     });
+    // 实测结论（2026-10-13）：商家开了"课程查看限制"，PC UA 会被 302 到限制引导页；
+    // 登录窗口强制手机 UA，走移动端 H5 形态才能正常登录/播放。
+    try {
+      loginWindow.webContents.setUserAgent(
+        'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 MicroMessenger/8.0.0'
+      );
+    } catch (_) {}
     loginWindow.on('closed', () => { loginWindow = null; });
     await loginWindow.loadURL(url);
     return { success: true, url };

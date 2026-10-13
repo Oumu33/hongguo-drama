@@ -11,6 +11,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   // 应用信息 / 官网链接
   checkAppUpdate: () => ipcRenderer.invoke('check-app-update'),
+  // 小鹅通（二开）
+  xiaoetongStatus: () => ipcRenderer.invoke('xiaoetong-status'),
+  xiaoetongLoginOpen: (shopId) => ipcRenderer.invoke('xiaoetong-login-open', shopId),
+  xiaoetongLoginFinish: () => ipcRenderer.invoke('xiaoetong-login-finish'),
+  xiaoetongLoginClose: () => ipcRenderer.invoke('xiaoetong-login-close'),
+  xiaoetongLogout: () => ipcRenderer.invoke('xiaoetong-logout'),
+  xiaoetongPurchased: () => ipcRenderer.invoke('xiaoetong-purchased'),
+  xiaoetongEpisodes: (seriesId) => ipcRenderer.invoke('xiaoetong-episodes', seriesId),
   openAppUpdate: () => ipcRenderer.invoke('open-app-update'),
   onAppUpdatePreference: cb => {
     const listener = (_event, enabled) => cb(enabled);

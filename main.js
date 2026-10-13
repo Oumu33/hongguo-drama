@@ -8,7 +8,7 @@
  *   4. 下载管理：进度推送、暂停/取消、重试、删除、打开所在文件夹
  *   5. 设置：下载目录、命名规则、并发数（JSON 文件持久化）
  */
-const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Menu, Notification, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, session, protocol, Menu, Notification, screen, safeStorage } = require('electron');
 const path = require('path');
 const IS_PREVIEW = require('./package.json').name === 'hongguo-experience-preview';
 if (IS_PREVIEW) {
@@ -26,6 +26,9 @@ const { pipeline } = require('node:stream/promises');
 const { randomUUID, createHash } = require('node:crypto');
 
 const hongguo = require('./src/native/hongguo');
+// 小鹅通（二开）
+const xiaoetong = require('./src/native/xiaoetong');
+const { registerXiaoetongIpc } = require('./src/native/xiaoetong-main');
 const { normalizeDownloadQuality, meetsDownloadQuality } = require('./src/native/download-quality');
 const { decryptInWorker } = require('./src/native/decrypt-worker.cjs');
 const store = require('./src/store');
@@ -3569,6 +3572,9 @@ function createWindow() {
 if (hasSingleInstanceLock) app.whenReady().then(async () => {
   const dataFile = path.join(app.getPath('userData'), 'data.json');
   store.init(dataFile);
+  // 小鹅通（二开）：会话加密持久化 + 登录窗口 IPC
+  xiaoetong.init(app.getPath('userData'), safeStorage);
+  registerXiaoetongIpc({ ipcMain, BrowserWindow });
   loadDownloadTasks();
   loadSeriesRegistry();
   try { rebuildSeriesRegistryFromTasks(); } catch (_) { /* storage-error reports the failed write when the window opens. */ }
