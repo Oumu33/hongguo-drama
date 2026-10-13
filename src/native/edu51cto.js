@@ -162,11 +162,15 @@ function parseLessonIdsFromCourseHtml(html) {
 
 /** 课程链接 → 课时列表（含标题）：取课程页解析出一个课时 ID，再调 index-data 拿全量 lesson_list */
 async function fetchCourseLessons(courseUrl) {
-  const m = String(courseUrl || '').match(/edu\.51cto\.com\/course\/(\d+)/);
-  if (!m) throw new Error('课程链接无效，应为 https://edu.51cto.com/course/{课程ID}.html 格式');
-  const courseId = m[1];
   const s = loadSession();
   if (!s.cookies.length) throw new Error('51CTO 未登录：请先扫码登录');
+  const input = String(courseUrl || '').trim();
+  // 直接给课时链接（已购列表的"继续学习"入口就是这种）：跳过课程页解析
+  const lessonMatch = input.match(/edu\.51cto\.com\/lesson\/(\d+)/);
+  if (lessonMatch) return lessonsFromLessonId(lessonMatch[1], input);
+  const m = input.match(/edu\.51cto\.com\/course\/(\d+)/);
+  if (!m) throw new Error('链接无效，应为课程页 https://edu.51cto.com/course/{课程ID}.html 或课时页 https://edu.51cto.com/lesson/{课时ID}.html');
+  const courseId = m[1];
   const { data: html } = await axios.get(`https://edu.51cto.com/course/${courseId}.html`, {
     headers: { 'User-Agent': PC_UA, Cookie: cookieHeader(s.cookies), Referer: 'https://edu.51cto.com/' },
     timeout: 20000, responseType: 'text',
@@ -178,16 +182,73 @@ async function fetchCourseLessons(courseUrl) {
   if (!ids.length) throw new Error('课程页未解析到课时列表（页面结构可能变化）');
   // 用第一个课时调 index-data 拿全量 lesson_list（含标题、试看标记）
   const meta = await fetchLessonMeta(ids[0]);
-  const lessons = meta.lessonList.length ? meta.lessonList.map((l, i) => ({
-    lessonId: String(l.id || l.lesson_id || ''),
-    title: String(l.title || l.lesson_title || `第${i + 1}节`),
-    isLook: l.is_look,
-  })).filter(l => l.lessonId) : ids.map((id, i) => ({ lessonId: id, title: `第${i + 1}节`, isLook: undefined }));
-  return { courseId, courseTitle, lessons };
+  return { courseId, courseTitle, lessons: normalizeLessonList(meta.lessonList, ids) };
+}
+
+async function lessonsFromLessonId(lessonId, referer) {
+  const meta = await fetchLessonMeta(lessonId);
+  const ids = meta.lessonList.length
+    ? meta.lessonList.map(l => String(l.id || l.lesson_id || '')).filter(Boolean)
+    : [String(lessonId)];
+  return { courseId: '', courseTitle: '', lessons: normalizeLessonList(meta.lessonList, ids), referer };
+}
+
+function normalizeLessonList(rawList, fallbackIds) {
+  if (Array.isArray(rawList) && rawList.length) {
+    return rawList.map((l, i) => ({
+      lessonId: String(l.id || l.lesson_id || ''),
+      title: String(l.title || l.lesson_title || l.name || `第${i + 1}节`),
+      isLook: l.is_look,
+    })).filter(l => l.lessonId);
+  }
+  return (fallbackIds || []).map((id, i) => ({ lessonId: String(id), title: `第${i + 1}节`, isLook: undefined }));
+}
+
+/** 已购课程列表：POST /center/course/user/get-study-course（表单 page/size，返回 {status:1, data:[...]}） */
+async function fetchPurchasedCourses(page = 1, size = 20) {
+  const s = loadSession();
+  if (!s.cookies.length) throw new Error('51CTO 未登录：请先扫码登录');
+  const body = new URLSearchParams({ page: String(page), size: String(size) }).toString();
+  const { data } = await axios.post('https://edu.51cto.com/center/course/user/get-study-course', body, {
+    headers: {
+      'User-Agent': PC_UA,
+      Accept: 'application/json, text/plain, */*',
+      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      'X-Requested-With': 'XMLHttpRequest',
+      Cookie: cookieHeader(s.cookies),
+      Referer: 'https://edu.51cto.com/center/course/user/get-study-course',
+    },
+    timeout: 20000,
+    validateStatus: st => st >= 200 && st < 400,
+  });
+  if (data?.status === -9) throw new Error('登录已过期，请重新扫码登录');
+  if (data?.status !== 1) throw new Error(`获取已购课程失败（status=${data?.status}，可能接口变化）`);
+  let list = Array.isArray(data.data) ? data.data : [];
+  if (!list.length && data.data && typeof data.data === 'object') {
+    const arr = Object.values(data.data).find(v => Array.isArray(v));
+    if (arr) list = arr;
+  }
+  return list.map(normalizePurchasedCourse).filter(c => c.title || c.courseId);
+}
+
+/** 已购记录字段名防御式归一化（JSON 原始字段名以实际返回为准） */
+function normalizePurchasedCourse(c) {
+  c = c || {};
+  const lessonUrl = c.lesson_url || c.lessonUrl || c.url || c.study_url || '';
+  const lessonMatch = String(lessonUrl).match(/\/lesson\/(\d+)\.html/);
+  return {
+    courseId: String(c.course_id ?? c.courseId ?? c.id ?? ''),
+    title: String(c.course_title ?? c.courseTitle ?? c.title ?? c.name ?? ''),
+    lessonCount: c.lesson_count ?? c.lessonCount ?? c.total_lesson ?? null,
+    duration: c.duration ?? c.total_time ?? null,
+    progress: c.study_progress ?? c.progress ?? null,
+    lessonId: lessonMatch ? lessonMatch[1] : String(c.lesson_id ?? c.lessonId ?? ''),
+    raw: c,
+  };
 }
 
 module.exports = {
   init, loginUrl, saveSession, clearSession, getSessionStatus, cookieHeader, loadSession,
   fetchLessonMeta, fetchPlayAuth, fetchM3u8Url, resolveLessonStream,
-  parseLessonIdsFromCourseHtml, fetchCourseLessons,
+  parseLessonIdsFromCourseHtml, fetchCourseLessons, fetchPurchasedCourses,
 };

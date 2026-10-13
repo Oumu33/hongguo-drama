@@ -64,6 +64,12 @@ function registerEdu51ctoIpc({ ipcMain, BrowserWindow, enqueueEdu51ctoLessons })
     return { success: true, status: edu51cto.getSessionStatus() };
   });
 
+  // 已购课程列表
+  ipcMain.handle('edu51cto-purchased', async () => {
+    try { return { success: true, courses: await edu51cto.fetchPurchasedCourses() }; }
+    catch (error) { return { success: false, error: error.message }; }
+  });
+
   // 课程链接 → 课时列表
   ipcMain.handle('edu51cto-lessons', async (_event, courseUrl) => {
     try { return { success: true, ...(await edu51cto.fetchCourseLessons(courseUrl)) }; }

@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   edu51ctoLoginFinish: () => ipcRenderer.invoke('edu51cto-login-finish'),
   edu51ctoLoginClose: () => ipcRenderer.invoke('edu51cto-login-close'),
   edu51ctoLogout: () => ipcRenderer.invoke('edu51cto-logout'),
+  edu51ctoPurchased: () => ipcRenderer.invoke('edu51cto-purchased'),
   edu51ctoLessons: (courseUrl) => ipcRenderer.invoke('edu51cto-lessons', courseUrl),
   edu51ctoDownloadBatch: (payload) => ipcRenderer.invoke('edu51cto-download-batch', payload),
   openAppUpdate: () => ipcRenderer.invoke('open-app-update'),

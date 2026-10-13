@@ -7,8 +7,9 @@ import './CustomSources.css';
  *
  * 流程：在 App 里点"扫码登录"→ 弹出 51CTO 统一登录窗口 → 用户微信扫码 →
  * 回到这里点"我已完成登录" → 主进程收 cookie 加密存本地。
- * 然后粘贴课程链接（如 https://edu.51cto.com/course/23845.html）→「获取课时」→
- * 勾选课时 →「下载选中」→ 进入下载队列（登录态→鉴权→m3u8→分片下载合并）。
+ * 登录后自动拉取已购课程列表 → 点一门「课时」→ 勾选课时 →「下载选中」→
+ * 进入下载队列（登录态→鉴权→m3u8→分片下载合并成本地 mp4，直接可播）。
+ * 也可以手动粘贴课程链接获取课时（备用入口）。
  *
  * 只下载用户自己已购课程；DRM 加密课时不支持下载。
  */
@@ -18,16 +19,29 @@ export default function Edu51ctoSettings({ active = true }) {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [courseUrl, setCourseUrl] = useState('');
+  const [purchased, setPurchased] = useState(null); // [{courseId,title,lessonCount,lessonId}]
   const [course, setCourse] = useState(null); // {courseId, courseTitle, lessons:[{lessonId,title,isLook}]}
   const [selected, setSelected] = useState({});
 
   const refresh = useCallback(async () => {
     try {
       const result = await window.electronAPI.edu51ctoStatus();
-      if (result?.success) setStatus(result.status || { loggedIn: false });
-      else throw new Error(result?.error || '状态读取失败');
+      if (result?.success) {
+        const st = result.status || { loggedIn: false };
+        setStatus(st);
+        if (st.loggedIn && purchased === null) fetchPurchased();
+      } else throw new Error(result?.error || '状态读取失败');
     } catch (cause) { setError(cause.message || '状态读取失败'); }
-  }, []);
+  }, [purchased]);
+
+  const fetchPurchased = () => run('purchased', async () => {
+    const result = await window.electronAPI.edu51ctoPurchased();
+    if (result?.success) {
+      setPurchased(result.courses || []);
+      if (!(result.courses || []).length) setMessage('已购课程列表为空（如刚购买，稍后再试）。');
+    }
+    return result;
+  });
 
   useEffect(() => { if (active) refresh(); }, [active, refresh]);
 
@@ -56,7 +70,20 @@ export default function Edu51ctoSettings({ active = true }) {
   });
   const logout = () => run('logout', async () => {
     const result = await window.electronAPI.edu51ctoLogout();
-    if (result?.success) { setMessage('已退出登录，本地登录态已清除。'); setCourse(null); setSelected({}); }
+    if (result?.success) { setMessage('已退出登录，本地登录态已清除。'); setCourse(null); setSelected({}); setPurchased(null); }
+    return result;
+  });
+
+  const openCourse = c => run('lessons', async () => {
+    // 优先用已购列表自带的课时入口（lessonId → index-data 全量课时表），没有才回退到课程链接输入
+    const input = c.lessonId ? `https://edu.51cto.com/lesson/${c.lessonId}.html`
+      : c.courseId ? `https://edu.51cto.com/course/${c.courseId}.html` : courseUrl.trim();
+    const result = await window.electronAPI.edu51ctoLessons(input);
+    if (result?.success) {
+      setCourse({ courseId: result.courseId || c.courseId, courseTitle: result.courseTitle || c.title, lessons: result.lessons });
+      setSelected({});
+      setMessage(`已获取《${result.courseTitle || c.title}》共 ${result.lessons.length} 节课时，勾选后点「下载选中」。`);
+    }
     return result;
   });
 
@@ -107,8 +134,31 @@ export default function Edu51ctoSettings({ active = true }) {
         </div>
       </div>
     </div>
+    {status.loggedIn && purchased && purchased.length > 0 && <div style={{ marginTop: 8 }}>
+      <div className="custom-source-row">
+        <div className="custom-source-info"><strong>已购课程</strong><span>共 {purchased.length} 门，点击「课时」进入下载</span></div>
+        <div className="custom-source-actions">
+          <button type="button" className="btn btn-outline btn-sm" disabled={!!busy} onClick={fetchPurchased}>
+            {busy === 'purchased' ? '刷新中…' : '刷新列表'}
+          </button>
+        </div>
+      </div>
+      <div style={{ maxHeight: 220, overflowY: 'auto', marginTop: 6 }}>
+        {purchased.map((c, i) => <div key={`${c.courseId || c.lessonId || i}`} className="custom-source-row">
+          <div className="custom-source-info">
+            <strong>{c.title || `课程${c.courseId}`}</strong>
+            <span>{c.lessonCount ? `${c.lessonCount}节` : ''}{c.duration ? ` · ${c.duration}` : ''}{c.progress ? ` · ${c.progress}` : ''}</span>
+          </div>
+          <div className="custom-source-actions">
+            <button type="button" className="btn btn-primary btn-sm" disabled={!!busy} onClick={() => openCourse(c)}>
+              {busy === 'lessons' ? '获取中…' : '课时'}
+            </button>
+          </div>
+        </div>)}
+      </div>
+    </div>}
     {status.loggedIn && <div className="custom-source-row" style={{ marginTop: 8 }}>
-      <input type="text" className="input" style={{ flex: 1 }} placeholder="粘贴课程链接，如 https://edu.51cto.com/course/23845.html"
+      <input type="text" className="input" style={{ flex: 1 }} placeholder="或粘贴课程链接，如 https://edu.51cto.com/course/23845.html"
         value={courseUrl} onChange={e => setCourseUrl(e.target.value)} disabled={!!busy} />
       <div className="custom-source-actions">
         <button type="button" className="btn btn-primary btn-sm" disabled={!!busy || !courseUrl.trim()} onClick={fetchLessons}>
