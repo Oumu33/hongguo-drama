@@ -110,15 +110,16 @@ async function fetchLessonMeta(lessonId) {
     lessonId: id,
     fileID: String(info.vodVideoId),
     sign: String(info.vodVideoIdAuth || ''),
-    playType: info.playType ?? 1, // 播放器调 vod-play-auth 时原样回传 type，实测如 3
+    playId: String(info.playId || 'courseindex'), // 播放器逻辑：playId=="courseindex" 则 type="course"，否则 type=playId
     isLook: info.is_look,
     lessonList: Array.isArray(info.lesson_list) ? info.lesson_list : [],
   };
 }
 
-async function fetchPlayAuth(lessonId, fileID, sign, playType) {
+async function fetchPlayAuth(lessonId, fileID, sign, playId) {
+  const type = playId === 'courseindex' ? 'course' : playId; // 与播放器 getNextVideoInfo 完全一致
   const data = await authedGet('https://edu.51cto.com/center/player/play/vod-play-auth', {
-    type: playType ?? 1, lesson_id: lessonId, id: fileID, sign, lesson_type: 'course',
+    type, lesson_id: lessonId, id: fileID, sign, lesson_type: 'course',
   });
   const info = data?.result?.data?.info;
   if (!info || !info.playAuth || !info.appID) throw new Error('换取播放凭证失败：未返回 playAuth（可能签名过期，请重试）');
@@ -144,7 +145,7 @@ async function fetchM3u8Url(appID, fileID, psign) {
 /** 完整链路：课时 ID → m3u8 地址（含标题信息） */
 async function resolveLessonStream(lessonId) {
   const meta = await fetchLessonMeta(lessonId);
-  const auth = await fetchPlayAuth(meta.lessonId, meta.fileID, meta.sign, meta.playType);
+  const auth = await fetchPlayAuth(meta.lessonId, meta.fileID, meta.sign, meta.playId);
   const m3u8Url = await fetchM3u8Url(auth.appID, meta.fileID, auth.psign);
   return { lessonId: meta.lessonId, m3u8Url, isLook: meta.isLook };
 }
