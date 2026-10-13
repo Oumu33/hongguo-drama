@@ -19,6 +19,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   xiaoetongLogout: () => ipcRenderer.invoke('xiaoetong-logout'),
   xiaoetongPurchased: () => ipcRenderer.invoke('xiaoetong-purchased'),
   xiaoetongEpisodes: (seriesId) => ipcRenderer.invoke('xiaoetong-episodes', seriesId),
+  // 51CTO 学堂（二开）
+  edu51ctoStatus: () => ipcRenderer.invoke('edu51cto-status'),
+  edu51ctoLoginOpen: () => ipcRenderer.invoke('edu51cto-login-open'),
+  edu51ctoLoginFinish: () => ipcRenderer.invoke('edu51cto-login-finish'),
+  edu51ctoLoginClose: () => ipcRenderer.invoke('edu51cto-login-close'),
+  edu51ctoLogout: () => ipcRenderer.invoke('edu51cto-logout'),
+  edu51ctoLessons: (courseUrl) => ipcRenderer.invoke('edu51cto-lessons', courseUrl),
+  edu51ctoDownloadBatch: (payload) => ipcRenderer.invoke('edu51cto-download-batch', payload),
   openAppUpdate: () => ipcRenderer.invoke('open-app-update'),
   onAppUpdatePreference: cb => {
     const listener = (_event, enabled) => cb(enabled);

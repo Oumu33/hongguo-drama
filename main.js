@@ -29,6 +29,9 @@ const hongguo = require('./src/native/hongguo');
 // 小鹅通（二开）
 const xiaoetong = require('./src/native/xiaoetong');
 const { registerXiaoetongIpc } = require('./src/native/xiaoetong-main');
+// 51CTO 学堂（二开）：已购课程鉴权下载
+const edu51cto = require('./src/native/edu51cto');
+const { registerEdu51ctoIpc } = require('./src/native/edu51cto-main');
 const { normalizeDownloadQuality, meetsDownloadQuality } = require('./src/native/download-quality');
 const { decryptInWorker } = require('./src/native/decrypt-worker.cjs');
 const store = require('./src/store');
@@ -621,9 +624,114 @@ function resumeAllTasks() {
 }
 
 // ===== 下载分发 =====
+// ----- 51CTO 学堂（二开）：已购课时鉴权下载 -----
+function sanitizeLessonName(name) {
+  return String(name || '').replace(/[\\/:*?"<>|]/g, '_').replace(/\s+/g, ' ').trim().slice(0, 80) || '未命名课时';
+}
+
+/** 把选中的 51CTO 课时推进下载队列（复用队列的并发/暂停/重试/进度能力） */
+async function enqueueEdu51ctoLessons({ courseId, courseTitle, lessons }) {
+  const settings = getCurrentSettings();
+  const root = String(settings.root || '').trim() || app.getPath('downloads');
+  const cleanCourseTitle = sanitizeFolderName(courseTitle) || `课程${courseId}`;
+  const downloadDir = path.join(root, '51CTO学堂', `${cleanCourseTitle}-${String(courseId)}`);
+  fs.mkdirSync(downloadDir, { recursive: true });
+  let created = 0;
+  lessons.forEach((lesson, i) => {
+    const lessonId = String(lesson.lessonId || '').trim();
+    if (!lessonId) return;
+    const indexStr = String(i + 1).padStart(2, '0');
+    const filename = `${indexStr}_${sanitizeLessonName(lesson.title)}.mp4`;
+    const task = {
+      id: `edu51cto-${lessonId}`,
+      platform: 'edu51cto',
+      type: 'edu51cto',
+      title: `《${cleanCourseTitle}》${lesson.title || `第${i + 1}节`}`,
+      filename,
+      savePath: path.join(downloadDir, filename),
+      customDir: downloadDir,
+      status: 'pending',
+      progress: 0,
+      receivedBytes: 0,
+      totalBytes: 0,
+      startTime: Date.now(),
+      videoInfo: { author: cleanCourseTitle, title: `《${cleanCourseTitle}》${lesson.title || ''}` },
+      edu51ctoInfo: { lessonId, courseId: String(courseId), courseTitle: cleanCourseTitle, lessonTitle: lesson.title || '' },
+    };
+    if (downloadTasks.some((t) => t.id === task.id)) return; // 已在任务列表，跳过
+    downloadTasks.unshift(task);
+    if (!downloadQueue.some((t) => t.id === task.id)) downloadQueue.push(task);
+    sendToRenderer('download-task-added', task);
+    created++;
+  });
+  if (created > 0) { try { saveDownloadTasks(); } catch (_) {} pumpQueue(); }
+  return created;
+}
+
+/** 执行单个 51CTO 课时下载：鉴权链路 → m3u8 → 复用 HLS 管线下载合并 */
+async function executeEdu51ctoDownload(task) {
+  const { id, edu51ctoInfo, filename } = task;
+  const { lessonId } = edu51ctoInfo || {};
+  if (!lessonId) throw new Error('课时 ID 缺失');
+  const source = axios.CancelToken.source();
+  task.cancelSource = source;
+  let tmpPath;
+  try {
+    task.status = 'downloading'; task.cancelled = false; task.progress = 0;
+    sendToRenderer('download-progress', { id, progress: 0, receivedBytes: 0, totalBytes: 0 });
+    const settings = getCurrentSettings();
+    const root = String(settings.root || '').trim() || app.getPath('downloads');
+    const downloadDir = task.customDir || root;
+    fs.mkdirSync(downloadDir, { recursive: true });
+    const finalPath = task.savePath || path.join(downloadDir, filename);
+    task.savePath = finalPath;
+    source.token.throwIfRequested();
+    if (fs.existsSync(finalPath)) {
+      task.status = 'completed'; task.progress = 100; task.endTime = Date.now();
+      saveDownloadTasks(); sendToRenderer('download-completed', { id, path: finalPath });
+      return;
+    }
+    // 鉴权链路：课时元信息 → vod-play-auth 换 psign → 腾讯云 getplayinfo v4 换 m3u8
+    const { m3u8Url } = await edu51cto.resolveLessonStream(lessonId);
+    source.token.throwIfRequested();
+    tmpPath = finalPath + '.hls.tmp';
+    await prepareHlsFile({ url: m3u8Url, vid: `edu51cto:${lessonId}` }, tmpPath, {
+      cancelToken: source.token,
+      onProgress: received => {
+        task.receivedBytes = received;
+        sendToRenderer('download-progress', { id, progress: 0, receivedBytes: received, totalBytes: 0 });
+      },
+    });
+    source.token.throwIfRequested();
+    publishDownloadFile(tmpPath, finalPath);
+    task.status = 'completed'; task.progress = 100; task.endTime = Date.now();
+    task.receivedBytes = task.totalBytes = fs.statSync(finalPath).size;
+    saveDownloadTasks();
+    sendToRenderer('download-completed', { id, path: finalPath });
+  } catch (error) {
+    try { if (tmpPath && fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    // 取消与失败区分（与红果任务一致）：取消不报错，失败进重试/展示
+    if (source.token.reason || axios.isCancel(error) || task.cancelled) {
+      if (task.status !== 'pending') {
+        task.status = 'stopped'; task.error = ''; task.endTime = Date.now();
+        sendToRenderer('download-stopped', { id });
+      }
+    } else {
+      task.status = 'failed'; task.error = error.message; task.endTime = Date.now();
+      sendToRenderer('download-failed', { id, error: error.message });
+    }
+    saveDownloadTasks();
+  } finally {
+    delete task.cancelSource;
+  }
+}
 async function executeDownload(task) {
   if (task.type === 'hongguo') {
     await executeHongguoDownload(task);
+    return;
+  }
+  if (task.type === 'edu51cto') {
+    await executeEdu51ctoDownload(task);
     return;
   }
   throw new Error('未知任务类型: ' + task.type);
@@ -3575,6 +3683,9 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   // 小鹅通（二开）：会话加密持久化 + 登录窗口 IPC
   xiaoetong.init(app.getPath('userData'), safeStorage);
   registerXiaoetongIpc({ ipcMain, BrowserWindow });
+  // 51CTO 学堂（二开）：会话加密持久化 + 登录窗口 IPC + 下载队列接入
+  edu51cto.init(app.getPath('userData'), safeStorage);
+  registerEdu51ctoIpc({ ipcMain, BrowserWindow, enqueueEdu51ctoLessons });
   loadDownloadTasks();
   loadSeriesRegistry();
   try { rebuildSeriesRegistryFromTasks(); } catch (_) { /* storage-error reports the failed write when the window opens. */ }
