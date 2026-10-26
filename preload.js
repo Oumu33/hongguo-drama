@@ -64,6 +64,15 @@ contextBridge.exposeInMainWorld('electronAPI', {
     return () => ipcRenderer.removeListener('online-play-progress', listener);
   },
 
+  // 扫码手机输入搜索
+  qrSearchStart: () => ipcRenderer.invoke('qr-search-start'),
+  qrSearchStop: () => ipcRenderer.invoke('qr-search-stop'),
+  onQrSearchKeyword: (cb) => {
+    const listener = (_e, data) => cb(data);
+    ipcRenderer.on('qr-search-keyword', listener);
+    return () => ipcRenderer.removeListener('qr-search-keyword', listener);
+  },
+
   // 兼容模式（HEVC -> H.264 转码，解决「黑屏有声」）
   transcodeForPlayback: (payload) => ipcRenderer.invoke('transcode-for-playback', payload),
   cancelTranscodeForPlayback: (payload) => ipcRenderer.invoke('cancel-transcode-for-playback', payload),

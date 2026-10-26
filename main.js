@@ -32,7 +32,10 @@ const { registerXiaoetongIpc } = require('./src/native/xiaoetong-main');
 // 51CTO 学堂（二开）：已购课程鉴权下载
 const edu51cto = require('./src/native/edu51cto');
 const { registerEdu51ctoIpc } = require('./src/native/edu51cto-main');
-const { normalizeDownloadQuality, meetsDownloadQuality } = require('./src/native/download-quality');
+const { normalizeDownloadQuality, meetsDownloadQuality, normalizePlayQuality, onlineCacheKey } = require('./src/native/download-quality');
+const { createQrSearchServer } = require('./src/native/qr-search');
+const { HlsStreamSession } = require('./src/native/hls-stream');
+const hlsSessions = new Map(); // hls streamId -> HlsStreamSession（随在线播放会话释放）
 const { decryptInWorker } = require('./src/native/decrypt-worker.cjs');
 const store = require('./src/store');
 const watchHistory = require('./src/native/watch-history');
@@ -78,6 +81,8 @@ const STREAM_SCHEME = 'hongguo-stream';
 // 决定（media-src / connect-src 必须显式列出 hongguo-stream: 与 hongguo-local:）。
 // 用 bypassCSP 绕开自家 CSP 会白白丢掉一层防护，属于掩盖配置疏漏，不要再加回来。
 const LOCAL_SCHEME = 'hongguo-local';
+// HLS 真流式协议：播放列表与分片经主进程按需供给（见 registerHlsProtocol）。
+const HLS_SCHEME = 'hongguo-hls';
 protocol.registerSchemesAsPrivileged([
   {
     scheme: STREAM_SCHEME,
@@ -85,6 +90,10 @@ protocol.registerSchemesAsPrivileged([
   },
   {
     scheme: LOCAL_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
+  },
+  {
+    scheme: HLS_SCHEME,
     privileges: { standard: true, secure: true, supportFetchAPI: true, stream: true, corsEnabled: true },
   },
 ]);
@@ -119,12 +128,15 @@ function releaseOnlineSession(id) {
   const session = onlineSessions.get(id);
   if (!session) return;
   onlineSessions.delete(id);
+  // HLS 会话可能被多个在线会话共享（同一集同档位的共享准备任务），最后一个用完才销毁
+  if (![...onlineSessions.values()].some((s) => s.entry?.hlsStreamId === id)) hlsSessions.delete(id);
   disposeOnlineDisk(session.entry);
   for (const controller of session.requests) controller.abort();
   const pending = session.job;
   if (pending && ![...onlineSessions.values()].some(s => s.job === pending)) {
     pending.controller.abort();
-    if (onlinePreparing.get(session.vid) === pending) onlinePreparing.delete(session.vid);
+    const pendingKey = session.cacheKey || session.vid;
+    if (onlinePreparing.get(pendingKey) === pending) onlinePreparing.delete(pendingKey);
   }
 }
 
@@ -175,6 +187,7 @@ function getDefaultSettings() {
     name_format: '剧名 集数',
     max_concurrent: 3,
     download_quality: 'auto',
+    play_quality: 'auto',
     custom_sources: [],
     // 看完一集后自动删除本地文件（边看边清，避免占用磁盘）
     auto_delete_watched: false,
@@ -2029,7 +2042,7 @@ function registerStreamProtocol() {
     const cleanup = () => { session.requests.delete(controller); request.signal.removeEventListener('abort', abort); };
     try {
       return await withMediaRecovery(session.vid, entry.seriesId,
-        { playInfo: entry.playInfo, signal: controller.signal, recover: !session.mediaStarted }, async playInfo => {
+        { playInfo: entry.playInfo, signal: controller.signal, recover: !session.mediaStarted, quality: session.quality || 'auto' }, async playInfo => {
         const identity = JSON.stringify([playInfo.url, playInfo.contentKey, playInfo.spadeA]);
         const checkIdentity = () => {
           if (session.mediaStarted && session.mediaIdentity !== identity) throw new Error('片源已变化，请重新连接播放');
@@ -2045,7 +2058,7 @@ function registerStreamProtocol() {
               try { checkIdentity(); } catch (error) { disposeOnlineDisk(prepared); throw error; }
               Object.assign(entry,prepared,{mediaIdentity:identity,vid:session.vid,source:/^custom:[^:]+/.exec(session.vid)?.[0] || 'hongguo',complete:true});
               delete entry.playInfo;
-              onlineCache.set(session.vid,entry); trimOnlineCache();
+              onlineCache.set(session.cacheKey || session.vid,entry); trimOnlineCache();
             })().catch(error => { delete entry.hlsJob; delete entry.hlsIdentity; throw error; });
           }
           if (entry.hlsIdentity !== identity) throw new Error('片源已变化，请重新连接播放');
@@ -2151,6 +2164,52 @@ function registerLocalProtocol() {
     } catch (e) {
       console.error('[Local] 读取失败:', e.message);
       return new Response('error', { status: 500, headers: { 'Content-Type': 'text/plain' } });
+    }
+  }));
+}
+
+/** HLS 真流式：列表由会话改写， 分片/密钥按请求现取源站，不整集落盘。 */
+async function fetchHlsText(url, playInfo) {
+  const { webMediaRequestOptions } = require('./src/native/web-media-guard');
+  const res = await axios({ url, method: 'GET', responseType: 'text', timeout: 30000,
+    ...webMediaRequestOptions(url),
+    headers: { ...(playInfo?.userAgent ? { 'User-Agent': playInfo.userAgent } : {}),
+      ...(playInfo?.referer ? { Referer: playInfo.referer } : {}), 'Accept-Encoding': 'identity' } });
+  if (res.status !== 200 || typeof res.data !== 'string') throw new Error('HLS 清单请求失败');
+  return res.data;
+}
+
+function registerHlsProtocol() {
+  protocol.handle(HLS_SCHEME, mediaWithCors(async (request) => {
+    try {
+      if (!['GET', 'HEAD'].includes(request.method)) return new Response(null, { status: 405 });
+      const url = new URL(request.url);
+      const entry = hlsSessions.get(url.hostname);
+      if (!entry) return new Response('session not found', { status: 404 });
+      const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent);
+      const { session, playInfo } = entry;
+      if (parts.length === 1 && parts[0].endsWith('.m3u8')) {
+        const name = parts[0] === 'index.m3u8' ? 'index' : parts[0].slice(0, -5);
+        const text = await session.playlistText(name);
+        return new Response(request.method === 'HEAD' ? null : text, { status: 200,
+          headers: { 'Content-Type': 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' } });
+      }
+      if (parts.length === 3 && (parts[0] === 'seg' || parts[0] === 'key')) {
+        const remote = session.resourceUrl(parts[1], parts[0], parts[2]);
+        const { webMediaRequestOptions } = require('./src/native/web-media-guard');
+        const upstream = await axios({ url: remote, method: 'GET', responseType: 'stream', timeout: 60000,
+          ...webMediaRequestOptions(remote),
+          headers: { ...(playInfo?.userAgent ? { 'User-Agent': playInfo.userAgent } : {}),
+            ...(playInfo?.referer ? { Referer: playInfo.referer } : {}), 'Accept-Encoding': 'identity' },
+          validateStatus: (status) => status === 200 });
+        const headers = { 'Cache-Control': 'no-store', 'Content-Type': parts[0] === 'key' ? 'application/octet-stream' : (upstream.headers['content-type'] || 'video/mp2t') };
+        if (upstream.headers['content-length']) headers['Content-Length'] = upstream.headers['content-length'];
+        if (request.method === 'HEAD') { upstream.data.destroy(); return new Response(null, { status: 200, headers }); }
+        return new Response(Readable.toWeb(upstream.data), { status: 200, headers });
+      }
+      return new Response('not found', { status: 404 });
+    } catch (error) {
+      return new Response('hls unavailable', { status: 502 });
     }
   }));
 }
@@ -2274,18 +2333,23 @@ async function prepareHlsEntry(playInfo,entry,signal,onProgress) {
 ipcMain.handle('prepare-online-play', async (event, payload) => {
   const { vid, seriesId, vidIndex, requestId, prefetch = false, force = false } = payload || {};
   if (!vid) return { success: false, error: '缺少 vid' };
+  let playQuality;
+  try { playQuality = normalizePlayQuality(payload.quality); }
+  catch (error) { return { success: false, error: error.message }; }
   const key = String(vid), streamId = randomUUID();
-  const session = { vid: key, requestId, requests: new Set(), entry: null };
+  // 缓存/准备任务按清晰度隔离；session.vid 保持真实 vid（流协议与取址都按真实 vid 工作）
+  const cacheKey = onlineCacheKey(key, playQuality);
+  const session = { vid: key, cacheKey, quality: playQuality, requestId, requests: new Set(), entry: null };
   onlineSessions.set(streamId, session);
   try {
     checkCustomAccess(key);
-    const checkedPlayInfo = /^(xifan|hema|custom):/.test(key) ? await hongguo.fetchPlayUrlSingle(key, seriesId, { force }) : null;
+    const checkedPlayInfo = /^(xifan|hema|custom):/.test(key) ? await hongguo.fetchPlayUrlSingle(key, seriesId, { force, quality: playQuality }) : null;
     if (!onlineSessions.has(streamId)) throw new Error('已取消播放');
     if (checkedPlayInfo && !checkedPlayInfo.url) throw new Error(checkedPlayInfo.error || '来源未开放该集');
-    if (force) deleteOnlineCacheEntry(key);
-    let entry = onlineCache.get(key), cached = !!entry;
+    if (force) deleteOnlineCacheEntry(cacheKey);
+    let entry = onlineCache.get(cacheKey), cached = !!entry;
     if (!entry) {
-      let job = onlinePreparing.get(key);
+      let job = onlinePreparing.get(cacheKey);
       if (!job || (force && !job.force)) {
         const controller = new AbortController();
         job = { controller, force };
@@ -2296,9 +2360,25 @@ ipcMain.handle('prepare-online-play', async (event, payload) => {
                 received,total,percent:total?Math.floor(received/total*100):0,phase:phase||'downloading'});
             }
           };
-          const prepared = await withMediaRecovery(key,seriesId,{playInfo:checkedPlayInfo,force,signal:controller.signal},async playInfo => {
-            const entry = {size:0,lastUsed:Date.now(),seriesId:String(seriesId||''),vidIndex:Number(vidIndex)||0};
-            if (playInfo.format === 'hls') await prepareHlsEntry(playInfo,entry,controller.signal,received => progress(received,0));
+          const prepared = await withMediaRecovery(key,seriesId,{playInfo:checkedPlayInfo,force,quality:playQuality,signal:controller.signal},async playInfo => {
+            const entry = {size:0,lastUsed:Date.now(),seriesId:String(seriesId||''),vidIndex:Number(vidIndex)||0,qualityLabel:playInfo.quality || null,width:playInfo.width || null,height:playInfo.height || null};
+            if (playInfo.format === 'hls' && !prefetch) {
+              // 真流式优先：建会话即可开播，分片边播边取；建会话失败（清单异常等）才回退整集准备。
+              try {
+                const hlsSession = new HlsStreamSession({ url: playInfo.url,
+                  fetchText: (u) => fetchHlsText(u, playInfo) });
+                await hlsSession.init();
+                if (controller.signal.aborted) throw new Error('已取消播放');
+                entry.hlsStreamId = streamId;
+                hlsSessions.set(streamId, { session: hlsSession, playInfo });
+                return entry;
+              } catch (error) {
+                if (controller.signal.aborted) throw error;
+                hlsSessions.delete(streamId);
+                await prepareHlsEntry(playInfo,entry,controller.signal,received => progress(received,0));
+              }
+            }
+            else if (playInfo.format === 'hls') await prepareHlsEntry(playInfo,entry,controller.signal,received => progress(received,0));
             else if (!prefetch && !playInfo.spadeA && !playInfo.contentKey) return {...entry,playInfo};
             else {
               entry.buffer = await fetchDecryptedEpisodeOnce(key,progress,seriesId,playInfo,controller.signal,prefetch?ONLINE_MAX_BYTES:Infinity);
@@ -2311,18 +2391,21 @@ ipcMain.handle('prepare-online-play', async (event, payload) => {
           prepared.lastUsed = Date.now();
           // Every waiter owns the finished file before eviction can remove its cache entry.
           for (const active of onlineSessions.values()) if (active.job === job) active.entry = {...prepared};
-          if (prepared.complete && onlinePreparing.get(key) === job) { onlineCache.set(key,prepared); trimOnlineCache(); }
+          if (prepared.complete && onlinePreparing.get(cacheKey) === job) { onlineCache.set(cacheKey,prepared); trimOnlineCache(); }
           return prepared;
-        })().finally(() => { if (onlinePreparing.get(key) === job) onlinePreparing.delete(key); });
-        onlinePreparing.set(key, job);
+        })().finally(() => { if (onlinePreparing.get(cacheKey) === job) onlinePreparing.delete(cacheKey); });
+        onlinePreparing.set(cacheKey, job);
       }
       session.job = job;
       entry = await job.promise;
     }
     if (!onlineSessions.has(streamId)) throw new Error('已取消播放');
     session.entry = { ...entry }; entry.lastUsed = Date.now();
-    return { success: true, url: `${STREAM_SCHEME}://play/${streamId}`, streamId, size: entry.size,
-      cached, streaming: !!entry.playInfo };
+    const hls = !!entry.hlsStreamId;
+    return { success: true, url: hls ? `${HLS_SCHEME}://${entry.hlsStreamId}/index.m3u8` : `${STREAM_SCHEME}://play/${streamId}`, streamId, size: entry.size,
+      cached, streaming: !!entry.playInfo, hls, quality: playQuality,
+      sourceQuality: entry.playInfo?.quality || entry.qualityLabel || null,
+      width: entry.playInfo?.width || entry.width || null, height: entry.playInfo?.height || entry.height || null };
   } catch (error) {
     releaseOnlineSession(streamId);
     return { success: false, error: error.message };
@@ -2333,6 +2416,29 @@ ipcMain.handle('release-online-play', async (event, payload = {}) => {
   for (const [id, session] of [...onlineSessions]) {
     if ((payload.streamId && id === payload.streamId) || (payload.requestId && session.requestId === payload.requestId)) releaseOnlineSession(id);
   }
+  return { success: true };
+});
+
+// ===== 扫码手机输入搜索（局域网一次性会话） =====
+let qrSearchSession = null;
+ipcMain.handle('qr-search-start', async () => {
+  try {
+    qrSearchSession?.close();
+    qrSearchSession = createQrSearchServer({ onKeyword: (keyword) => sendToRenderer('qr-search-keyword', { keyword }) });
+    await qrSearchSession.listen();
+    if (!qrSearchSession.urls.length) {
+      qrSearchSession.close(); qrSearchSession = null;
+      return { success: false, error: '没有可用的局域网地址，请确认电脑已连上 WiFi 或网线后重试' };
+    }
+    return { success: true, urls: qrSearchSession.urls };
+  } catch (error) {
+    qrSearchSession = null;
+    return { success: false, error: error.message || '二维码服务启动失败' };
+  }
+});
+ipcMain.handle('qr-search-stop', async () => {
+  qrSearchSession?.close();
+  qrSearchSession = null;
   return { success: true };
 });
 
@@ -2993,6 +3099,7 @@ ipcMain.handle('save-settings', async (event, settings) => {
     const wasCheckingUpdates = getCurrentSettings().app_updates_enabled !== false;
     const merged = { ...getDefaultSettings(), ...(settings || {}), custom_sources:getCurrentSettings().custom_sources };
     merged.download_quality = normalizeDownloadQuality(merged.download_quality);
+    merged.play_quality = normalizePlayQuality(merged.play_quality);
     store.saveSettings(merged);
     if (wasCheckingUpdates !== (merged.app_updates_enabled !== false)) {
       sendToRenderer('app-update-preference', merged.app_updates_enabled !== false);
@@ -3694,6 +3801,7 @@ if (hasSingleInstanceLock) app.whenReady().then(async () => {
   loadMergeTasks();
   registerStreamProtocol();
   registerLocalProtocol();
+  registerHlsProtocol();
   const settings = getCurrentSettings();
 
   // 代理必须在创建窗口、发起任何请求之前生效
