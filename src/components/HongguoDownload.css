@@ -60,3 +60,9 @@
 .batch-quality-control { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
 .batch-quality-control .input-field { width: auto; max-width: 100%; min-height: 36px; }
 .batch-quality-hint { margin: 0 0 16px; }
+
+/* 扫码手机输入 */
+.qr-search-box{display:flex;gap:16px;align-items:flex-start;margin-top:12px;padding:14px;border:1px solid var(--border,#e3ddd2);border-radius:12px;background:var(--surface,#fff)}
+.qr-search-box img{border-radius:8px;flex:none}
+.qr-search-text p{margin:0 0 8px;line-height:1.55}
+.qr-search-url{word-break:break-all;font-size:12px;opacity:.75}

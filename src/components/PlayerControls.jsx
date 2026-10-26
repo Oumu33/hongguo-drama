@@ -11,7 +11,7 @@ const formatTime = seconds => {
 };
 const Icon = ({ children }) => <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{children}</svg>;
 
-export default function PlayerControls({ danmaku, enhancement, shortcuts = DEFAULT_SHORTCUTS, onToggleFullscreen, videoRef, stageRef, source, available, continuing = false, autoContinue = false, rate, onRateChange, onError, pictureMode = 'fit', onPictureModeChange, portrait = false, windowFill = false, onWindowFill }) {
+export default function PlayerControls({ danmaku, enhancement, shortcuts = DEFAULT_SHORTCUTS, onToggleFullscreen, videoRef, stageRef, source, available, continuing = false, autoContinue = false, rate, onRateChange, onError, pictureMode = 'fit', onPictureModeChange, portrait = false, windowFill = false, onWindowFill, playQuality = 'auto', actualQuality = '', onPlayQualityChange }) {
   const [media, setMedia] = useState({ paused: true, ended: false, time: 0, duration: 0, muted: false, volume: 1 });
   const [fullscreen, setFullscreen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -235,6 +235,12 @@ export default function PlayerControls({ danmaku, enhancement, shortcuts = DEFAU
               <option value="width">保持宽度</option>
             </select></label>
             <span id="picture-mode-hint">{pictureMode === 'width' ? '按宽度显示，上下可能裁剪。按剧单独记忆。' : '完整显示，随窗口缩放。按剧单独记忆。'}</span>
+            {onPlayQualityChange && <label className="player-play-quality">播放清晰度<select aria-label="播放清晰度" aria-describedby="play-quality-hint" value={playQuality} onChange={event => onPlayQualityChange(event.target.value)}>
+              <option value="auto">自动（兼容优先）</option>
+              <option value="1080p">1080P</option>
+              <option value="720p">720P</option>
+            </select></label>}
+            {onPlayQualityChange && <span id="play-quality-hint">{actualQuality ? `当前片源：${actualQuality}。` : ''}仅在线播放生效；本集没有所选档位时提示并改用自动档。</span>}
             {enhancement && <VideoEnhancementControls enhancement={enhancement} available={available} />}
             {SHORTCUT_ACTIONS.map(action => <span key={action.id}>{formatShortcut(shortcuts[action.id])}：{action.label}</span>)}
           </div>}

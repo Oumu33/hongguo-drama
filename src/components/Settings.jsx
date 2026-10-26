@@ -63,7 +63,7 @@ function SettingsPage({ active = true, preview = false }) {
 
   const loadSettings = async () => {
     setLoadError('');
-    try { setSettings({ download_quality: 'auto', ...await window.electronAPI.getSettings() }); }
+    try { setSettings({ download_quality: 'auto', play_quality: 'auto', ...await window.electronAPI.getSettings() }); }
     catch (error) { setLoadError(error.message || '设置加载失败，请重试'); }
   };
 
@@ -99,7 +99,7 @@ function SettingsPage({ active = true, preview = false }) {
     try {
       // Playback options may change while this retained settings page is hidden.
       const current = await window.electronAPI.getSettings();
-      const editable = ['root', 'name_format', 'download_quality', 'show_danmaku_controls', 'max_concurrent', 'proxy_enabled', 'proxy_mode', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password', 'watch_updates_enabled', 'watch_sequels_enabled', 'watch_notifications_enabled', 'app_updates_enabled'];
+      const editable = ['root', 'name_format', 'download_quality', 'play_quality', 'show_danmaku_controls', 'max_concurrent', 'proxy_enabled', 'proxy_mode', 'proxy_host', 'proxy_port', 'proxy_username', 'proxy_password', 'watch_updates_enabled', 'watch_sequels_enabled', 'watch_notifications_enabled', 'app_updates_enabled'];
       const submitted = { ...current };
       for (const key of editable) if (Object.hasOwn(next, key)) submitted[key] = next[key];
       const res = await window.electronAPI.saveSettings(submitted);
@@ -250,6 +250,18 @@ function SettingsPage({ active = true, preview = false }) {
             <option value="720p">720P</option>
           </select>
           <p className="settings-hint" id="default-download-quality-hint">保存后用于新建下载任务，也可在下载时单独选择。所选清晰度不可用时提示，不自动降级；已有文件不自动删除或覆盖。</p>
+        </div>
+
+        <div className="settings-group">
+          <label className="settings-label" htmlFor="default-play-quality">默认播放清晰度</label>
+          <select id="default-play-quality" className="input-field select-field"
+            value={settings.play_quality || 'auto'} aria-describedby="default-play-quality-hint"
+            onChange={(event) => update('play_quality', event.target.value)}>
+            <option value="auto">自动（兼容优先）</option>
+            <option value="1080p">1080P</option>
+            <option value="720p">720P</option>
+          </select>
+          <p className="settings-hint" id="default-play-quality-hint">仅影响在线播放，与下载清晰度分开保存；也可在播放器里随时切换。本集没有所选档位时提示并改用自动档，不会转去下载。</p>
         </div>
 
         <div className="settings-group">

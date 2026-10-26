@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import './HongguoDownload.css';
-import { Search, Film, RefreshCw, ExternalLink } from './icons';
+import { Search, Film, RefreshCw, ExternalLink, QrCode } from './icons';
+import QRCode from 'qrcode';
 import { isSubmitKey } from './episodeRange';
 import { readSearchHistory, saveSearchTerm, clearSearchHistory, rememberCatalogTitles, getSearchSuggestions } from '../searchHistory';
 
@@ -27,6 +28,11 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
   const [error, setError] = useState('');
   const [pageTitle, setPageTitle] = useState('');
   const [pickingId, setPickingId] = useState('');
+  const [qrOpen, setQrOpen] = useState(false);
+  const [qrImg, setQrImg] = useState('');
+  const [qrUrl, setQrUrl] = useState('');
+  const [qrBusy, setQrBusy] = useState(false);
+  const [qrError, setQrError] = useState('');
 
   useEffect(() => {
     if (!active) {
@@ -34,7 +40,9 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
       pendingSearch.current = null;
       setPickingId('');
       setLoading(false);
+      closeQr();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active]);
 
   useEffect(() => {
@@ -75,9 +83,9 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
     }
   };
 
-  const doSearch = async () => {
+  const doSearch = async (override) => {
     if (sourcesLoading) return;
-    const kw = keyword.trim();
+    const kw = (typeof override === 'string' ? override : keyword).trim();
     if (!kw) {
       setError('请输入剧名关键词');
       return;
@@ -130,6 +138,47 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
     }
   };
 
+  const closeQr = () => {
+    setQrOpen(false);
+    setQrImg('');
+    setQrUrl('');
+    window.electronAPI.qrSearchStop?.().catch(() => {});
+  };
+
+  const openQr = async () => {
+    if (qrBusy) return;
+    setQrBusy(true);
+    setQrError('');
+    try {
+      const res = await window.electronAPI.qrSearchStart();
+      if (!res?.success || !res.urls?.length) throw new Error(res?.error || '二维码生成失败');
+      const url = res.urls[0];
+      const img = await QRCode.toDataURL(url, { width: 232, margin: 1 });
+      setQrUrl(url);
+      setQrImg(img);
+      setQrOpen(true);
+    } catch (e) {
+      setQrError(e.message || '二维码生成失败，请重试');
+    } finally {
+      setQrBusy(false);
+    }
+  };
+
+  const doSearchRef = useRef(null);
+  doSearchRef.current = doSearch;
+  useEffect(() => {
+    if (!window.electronAPI.onQrSearchKeyword) return undefined;
+    const off = window.electronAPI.onQrSearchKeyword(({ keyword: kw }) => {
+      const value = String(kw || '').trim();
+      if (!value) return;
+      closeQr();
+      setKeyword(value);
+      doSearchRef.current?.(value);
+    });
+    return () => { off?.(); window.electronAPI.qrSearchStop?.().catch(() => {}); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // 选中某部剧 -> 拉取完整分集 -> 交给下载页
   const pick = async (item) => {
     const request = ++requestVersion.current;
@@ -180,7 +229,12 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
           onChange={(e) => changeKeyword(e.target.value)}
           onKeyDown={(e) => isSubmitKey(e) && doSearch()}
         />
-        <button className="btn btn-primary" onClick={doSearch} disabled={loading || sourcesLoading}>
+        <button type="button" className="btn btn-outline" onClick={openQr} disabled={qrBusy}
+          title="手机和电脑连同一个 WiFi，扫码后在手机上输入剧名">
+          <QrCode size={16} />
+          <span>{qrBusy ? '生成中...' : '手机输入'}</span>
+        </button>
+        <button className="btn btn-primary" onClick={() => doSearch()} disabled={loading || sourcesLoading}>
           {loading ? (
             <>
               <RefreshCw size={16} className="spin" />
@@ -194,6 +248,18 @@ function SearchPanel({ onSelectSeries, onSwitchToInput, active = true }) {
           )}
         </button>
       </div>
+      {qrError && <p className="search-history-error" role="alert">{qrError}</p>}
+      {qrOpen && (
+        <div className="qr-search-box">
+          {qrImg && <img src={qrImg} alt="手机输入二维码" width="232" height="232" />}
+          <div className="qr-search-text">
+            <p><strong>手机扫码输入剧名</strong></p>
+            <p>手机和电脑要连同一个 WiFi。扫码后在手机上输入剧名点发送，这里会自动填入并搜索。二维码 5 分钟内有效，收到一次输入就自动关闭。</p>
+            <p className="qr-search-url">扫不出来时在手机浏览器打开：{qrUrl}</p>
+            <button type="button" className="btn btn-outline" onClick={closeQr}>关闭二维码</button>
+          </div>
+        </div>
+      )}
       <datalist id="local-search-suggestions">
         {suggestions.map(({ term, source: origin }) => <option key={term} value={term} label={origin} />)}
       </datalist>

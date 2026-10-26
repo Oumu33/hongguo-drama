@@ -188,6 +188,16 @@ export const Search = (p) => (
   </svg>
 );
 
+export const QrCode = (p) => (
+  <svg {...baseProps(p.size, p.strokeWidth, p.className, p.style)}>
+    <rect x="3" y="3" width="7" height="7" rx="1" />
+    <rect x="14" y="3" width="7" height="7" rx="1" />
+    <rect x="3" y="14" width="7" height="7" rx="1" />
+    <path d="M14 14h3v3h-3z" />
+    <path d="M21 14v3h-3M14 21h3M21 21h.01" />
+  </svg>
+);
+
 export const Link2 = (p) => (
   <svg {...baseProps(p.size, p.strokeWidth, p.className, p.style)}>
     <path d="M15 7h3a5 5 0 0 1 5 5 5 5 0 0 1-5 5h-3m-6 0H6a5 5 0 0 1-5-5 5 5 0 0 1 5-5h3" />

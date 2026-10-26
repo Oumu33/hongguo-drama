@@ -6,6 +6,7 @@ import { SHORTCUT_ACTIONS, formatShortcut, ignoresPlaybackShortcut, readShortcut
 import CommunityPanel from './CommunityPanel';
 import VideoEnhancement, { useVideoEnhancement } from './VideoEnhancement';
 import './Player.css';
+import Hls from 'hls.js';
 import { Play, Film, Download, Check, RefreshCw, Layers, X, Trash2, ChevronDown, Zap } from './icons';
 
 const localMediaKey = (seriesId, episode) => JSON.stringify([seriesId, episode?.vid, episode?.fileUrl, episode?.fileSize, episode?.taskId]);
@@ -48,6 +49,8 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
   const [cacheNextSaving, setCacheNextSaving] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
   const [downloadQuality, setDownloadQuality] = useState('auto');
+  const [playQuality, setPlayQuality] = useState('auto'); // 播放清晰度（与下载清晰度分开存 play_quality）
+  const [actualQuality, setActualQuality] = useState(''); // 当前在线片源的实际清晰度标签（后端回传）
   const [qualityLoading, setQualityLoading] = useState(true);
   const [waitingFor, setWaitingFor] = useState(null); // 正在等待下载的集号
   const [toast, setToast] = useState(null);
@@ -60,6 +63,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
   // 在线播放（按需流式或临时准备后缓存）
   const [onlineVid, setOnlineVid] = useState(null);
   const [onlineUrl, setOnlineUrl] = useState('');
+  const [hlsUrl, setHlsUrl] = useState(''); // HLS 真流式会话地址（由 hls.js 接管，不直接喂给 video.src）
   const [mediaBuffering, setMediaBuffering] = useState(false);
   const [onlineProgress, setOnlineProgress] = useState(null); // {percent, phase}
   const [cacheInfo, setCacheInfo] = useState({ count: 0, bytes: 0 });
@@ -83,12 +87,16 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
   const videoRef = useRef(null);
   const stageRef = useRef(null);
   const playbackRateRef = useRef(1);
+  const playQualityRef = useRef('auto');
+  const hlsRef = useRef(null);
+  const hlsActiveRef = useRef(false);
+  const destroyHls = () => { try { hlsRef.current?.destroy(); } catch (_) {} hlsRef.current = null; hlsActiveRef.current = false; };
   const toastTimer = useRef(null);
   const pendingSeekRef = useRef(0); // 切集后要跳转的秒数
   const pendingAutoplayRef = useRef(true);
   const lastSavedRef = useRef(0);
   const stateRef = useRef({ currentIndex, autoNext, activeSeriesId });
-  stateRef.current = { currentIndex, autoNext, activeSeriesId, waitingFor, downloadQuality, qualityLoading };
+  stateRef.current = { currentIndex, autoNext, activeSeriesId, waitingFor, downloadQuality, playQuality, qualityLoading };
   const selectedSeriesRef = useRef('');
   const selectionVersion = useRef(0);
   const onlineRequestRef = useRef(null);
@@ -159,6 +167,8 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     cancelCompat();
     releaseOnline();
     releasePrefetch();
+    destroyHls();
+    setHlsUrl('');
     setOnlineVid(null);
     setOnlineUrl('');
     setOnlineProgress(null);
@@ -235,6 +245,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     resetPlayback(autoplay);
     onlineSourceRef.current = null;
     setCompatMap(prev => { const next = { ...prev }; delete next[ep.vid_index]; return next; });
+    setActualQuality('');
     pendingSeekRef.current = seekTo;
     setCurrentIndex(ep.vid_index);
     setWaitingFor(null);
@@ -244,39 +255,27 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     && intent.selection === selectionVersion.current && intent.media === mediaVersion.current
     && intent.seriesId === selectedSeriesRef.current && intent.vidIndex === stateRef.current.currentIndex, []);
 
+  // 点开即播（一期）：在线失败只做在线恢复——先看本地有没有下好的同集，有就播本地；
+  // 没有就停在报错页让用户重试/换清晰度，绝不自动塞进下载队列等下载。
+  // 下载只由用户主动点「下载本集 / 下载未完成集」触发（downloadEpisode/downloadMissing）。
   const recoverOnlineFailure = useCallback(async (ep, message) => {
     const seekTo = currentPosition();
     const autoplay = loadedMediaRef.current ? !loadedMediaRef.current.element.paused : pendingAutoplayRef.current;
     resetPlayback(autoplay);
     pendingSeekRef.current = seekTo;
     const intent = { seriesId: selectedSeriesRef.current, vidIndex: ep.vid_index, vid: ep.vid,
-      selection: selectionVersion.current, media: mediaVersion.current, seekTo, autoplay, submitting: true };
+      selection: selectionVersion.current, media: mediaVersion.current, seekTo, autoplay, submitting: false };
     fallbackRef.current = intent;
-    setPlaybackError(message);
     try {
       const data = await loadDetail(intent.seriesId);
       if (!isCurrentFallback(intent)) return;
       const latest = data?.episodes.find(item => item.vid_index === intent.vidIndex && item.vid === intent.vid);
-      if (!latest || latest.locked) throw new Error(latest?.locked ? '该集已锁定，请在来源平台确认' : '无法刷新本集状态，请重试');
-      if (usableLocal(latest, intent.seriesId)) { resumeLocal(latest, intent.seekTo, intent.autoplay); return; }
-      const key = `${intent.selection}:${intent.seriesId}:${intent.vid}`;
-      if (fallbackAttemptRef.current === key) throw new Error('本集已尝试下载，请在下载管理检查或手动重试下载');
-      const settings = stateRef.current.qualityLoading ? await window.electronAPI.getSettings() : null;
-      if (!isCurrentFallback(intent)) return;
-      const quality = stateRef.current.qualityLoading
-        ? (['1080p', '720p'].includes(settings?.download_quality) ? settings.download_quality : 'auto') : stateRef.current.downloadQuality;
-      fallbackAttemptRef.current = key;
-      setPlaybackError(''); setWaitingFor(intent.vidIndex);
-      // Enqueue validates quality and reuses an existing task; cancelling playback never stops that shared download.
-      const result = await window.electronAPI.downloadSingleEpisode(intent.seriesId, intent.vidIndex, quality);
-      if (!isCurrentFallback(intent)) return;
-      if (!result?.success) throw new Error(result?.error || '下载加入失败');
-      intent.submitting = false;
-    } catch (error) {
-      if (!isCurrentFallback(intent)) return;
-      intent.submitting = false;
-      setWaitingFor(null); setPlaybackError(`${message}；${error.message}`);
-    }
+      if (latest && !latest.locked && usableLocal(latest, intent.seriesId)) { resumeLocal(latest, intent.seekTo, intent.autoplay); return; }
+      if (latest?.locked) { setPlaybackError('该集已锁定，请在来源平台确认'); return; }
+    } catch (_) { /* 刷新状态失败不遮住原始报错 */ }
+    if (!isCurrentFallback(intent)) return;
+    setWaitingFor(null);
+    setPlaybackError(`${message}。可点「重试本集（在线播放）」或「重新连接片源」，也可以切换播放清晰度后再试；需要离线看时请手动点「下载本集」。`);
   }, [currentPosition, resetPlayback, loadDetail, isCurrentFallback, usableLocal, resumeLocal]);
 
   const refreshCacheInfo = useCallback(async () => {
@@ -325,6 +324,8 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     window.electronAPI.getSettings().then((settings) => {
       if (!cancelled) {
         setDownloadQuality(['1080p', '720p'].includes(settings?.download_quality) ? settings.download_quality : 'auto');
+        const pq = ['1080p', '720p'].includes(settings?.play_quality) ? settings.play_quality : 'auto';
+        setPlayQuality(pq); playQualityRef.current = pq;
         setShowDanmakuControls(settings?.show_danmaku_controls !== false);
       }
     }).catch(() => {
@@ -457,17 +458,21 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
   );
 
   const compatUrl = current ? compatMap[current.vid_index] : null;
-  const isOnlinePlaying = onlineVid && current && current.vid === onlineVid && onlineUrl;
+  const isOnlinePlaying = onlineVid && current && current.vid === onlineVid && (onlineUrl || hlsUrl);
   const canPlay = !!(!playbackError && !onlineProgress && current && !current.locked && (compatUrl || usableLocal(current, String(activeSeriesId)) || isOnlinePlaying));
-  const playableSource = compatUrl || (isOnlinePlaying ? onlineUrl : current?.fileUrl) || '';
+  const playableSource = compatUrl || (isOnlinePlaying ? (onlineUrl || hlsUrl) : current?.fileUrl) || '';
+  const hlsActive = !!hlsUrl && !!isOnlinePlaying && !compatUrl;
+  hlsActiveRef.current = hlsActive;
   // 原生全屏依附于 video 节点。准备下一集时保留结束帧，换源不换节点。
   if (canPlay) lastVideoSrcRef.current = playableSource;
-  const videoSrc = compatProgress ? '' : lastVideoSrcRef.current;
-  const danmaku = useCommentDanmaku({ seriesId: activeSeriesId, episodeId: current?.vid, active: active && canPlay && showDanmakuControls, source: videoSrc });
+  // HLS 时 video 元素不直接吃这个地址（hls.js 用 MSE 接管），src 必须留空，否则浏览器会当普通媒体加载报错。
+  const videoSrc = compatProgress ? '' : hlsActive ? '' : lastVideoSrcRef.current;
+  const danmaku = useCommentDanmaku({ seriesId: activeSeriesId, episodeId: current?.vid, active: active && canPlay && showDanmakuControls, source: playableSource || videoSrc });
 
   useEffect(() => {
     const v = videoRef.current;
     if (loading || !canPlay || !v) return;
+    if (hlsActiveRef.current) return;
     const previous = lastLoadRef.current;
     lastLoadRef.current = { source: videoSrc, version: playbackVersion };
     v.defaultPlaybackRate = playbackRateRef.current;
@@ -475,6 +480,40 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     if (previous?.source === videoSrc && previous.version !== playbackVersion) { v.src = videoSrc; v.load(); }
     v.playbackRate = playbackRateRef.current;
   }, [loading, canPlay, videoSrc, playbackVersion]);
+
+  // HLS 真流式：hls.js 接管 video 元素（MSE 边播边拉分片），错误先自恢复、再走重连片源。
+  const reconnectRef = useRef(null);
+  useEffect(() => {
+    if (!hlsUrl || !canPlay) return undefined;
+    const v = videoRef.current;
+    if (!v) return undefined;
+    let hls = null;
+    if (Hls.isSupported()) {
+      hls = new Hls({ maxBufferLength: 30, fragLoadingMaxRetry: 2, manifestLoadingMaxRetry: 1 });
+      hlsRef.current = hls;
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(v);
+      let recovered = false;
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (!data?.fatal) return;
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
+          recovered = true;
+          try { hls.recoverMediaError(); } catch (_) {}
+          return;
+        }
+        showToast('HLS 播放失败，正在重新连接片源…');
+        reconnectRef.current?.();
+      });
+    } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      v.src = hlsUrl;
+    }
+    return () => {
+      if (hls) {
+        try { hls.destroy(); } catch (_) {}
+        if (hlsRef.current === hls) hlsRef.current = null;
+      }
+    };
+  }, [hlsUrl, canPlay, showToast]);
 
   const playableCount = episodes.filter((e) => e.status === 'completed').length;
 
@@ -577,7 +616,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     const media = loadedMediaRef.current;
     const element = event.currentTarget;
     if (playbackVersion !== mediaVersion.current || !canPlay || media?.version !== mediaVersion.current || media.element !== element) return;
-    if (element.currentSrc && element.currentSrc !== videoSrc) return;
+    if (element.currentSrc && element.currentSrc !== videoSrc && !hlsActiveRef.current) return;
     if (!media.played) {
       media.played = true;
       persistPosition(true);
@@ -614,7 +653,9 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
       }
       onlineSourceRef.current = `${activeSeriesId}:${vidIndex}`;
       const seekTo = resumeAt ?? (vidIndex === stateRef.current.currentIndex ? currentPosition() : 0);
-      const prefetched = !force && prefetchRef.current?.vid === ep.vid && prefetchRef.current?.seriesId === activeSeriesId ? prefetchRef.current : null;
+      const wantQuality = playQualityRef.current;
+      const prefetched = !force && prefetchRef.current?.vid === ep.vid && prefetchRef.current?.seriesId === activeSeriesId
+        && (prefetchRef.current.quality || 'auto') === wantQuality ? prefetchRef.current : null;
       if (prefetched) prefetchRef.current = null;
       resetPlayback(autoplay);
       setCompatMap(prev => { const next = { ...prev }; delete next[vidIndex]; return next; });
@@ -623,6 +664,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
       pendingSeekRef.current = seekTo;
       setCurrentIndex(vidIndex);
       setWaitingFor(null);
+      setActualQuality('');
       setOnlineProgress({ vid: ep.vid, percent: 0, phase: 'preparing' });
       setOnlineVid(ep.vid);
       setOnlineUrl('');
@@ -635,10 +677,27 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
           seriesId: activeSeriesId,
           vidIndex,
           force,
+          quality: wantQuality,
         });
         if (onlineRequestRef.current !== request) {
           window.electronAPI.releaseOnlinePlay({ requestId: request.requestId, streamId: res?.streamId }).catch(() => {});
           return;
+        }
+        // 指定清晰度取不到源时不静默降级、也不转下载：明确提示后用自动档再试一次，保证点开能播。
+        if ((!res || !res.success) && wantQuality !== 'auto') {
+          showToast(`本集没有 ${wantQuality.toUpperCase()} 片源，已改用自动清晰度播放`);
+          res = await window.electronAPI.prepareOnlinePlay({
+            requestId: request.requestId,
+            vid: ep.vid,
+            seriesId: activeSeriesId,
+            vidIndex,
+            force,
+            quality: 'auto',
+          });
+          if (onlineRequestRef.current !== request) {
+            window.electronAPI.releaseOnlinePlay({ requestId: request.requestId, streamId: res?.streamId }).catch(() => {});
+            return;
+          }
         }
         if (!res || !res.success) {
           await recoverOnlineFailure(ep, (res && res.error) || '在线播放准备失败');
@@ -646,8 +705,10 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
         }
         request.streamId = res.streamId;
         request.prepared = true;
+        setActualQuality(res.sourceQuality || (res.quality && res.quality !== 'auto' ? res.quality : ''));
         setMediaBuffering(true);
-        setOnlineUrl(res.url);
+        if (res.hls) { destroyHls(); setOnlineUrl(''); setHlsUrl(res.url); }
+        else { destroyHls(); setHlsUrl(''); setOnlineUrl(res.url); }
         setOnlineProgress(null);
         refreshCacheInfo();
       } catch (e) {
@@ -658,6 +719,29 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     [episodes, activeSeriesId, showToast, refreshCacheInfo, resetPlayback, releaseOnline, currentPosition, recoverOnlineFailure]
   );
 
+  // 切换播放清晰度：存 play_quality（与下载清晰度互不影响）；
+  // 正在在线播放时按新档位重新取源并回到原进度，本地文件播放则下次在线播放生效。
+  const changePlayQuality = async (next) => {
+    if (!['auto', '1080p', '720p'].includes(next) || next === playQualityRef.current) return;
+    playQualityRef.current = next;
+    setPlayQuality(next);
+    releasePrefetch();
+    try {
+      const s = await window.electronAPI.getSettings();
+      const result = await window.electronAPI.saveSettings({ ...s, play_quality: next });
+      if (!result?.success) throw new Error(result?.error || '设置保存失败');
+    } catch (error) {
+      showToast(`播放清晰度已切换，但未能保存设置：${error.message}`);
+    }
+    if (onlineSourceRef.current === `${activeSeriesId}:${stateRef.current.currentIndex}`) {
+      showToast(`正在切换为${next === 'auto' ? '自动' : next.toUpperCase()}清晰度…`);
+      startOnlinePlay(stateRef.current.currentIndex, currentPosition(), true,
+        loadedMediaRef.current ? !loadedMediaRef.current.element.paused : pendingAutoplayRef.current);
+    } else {
+      showToast(`播放清晰度已设为${next === 'auto' ? '自动（兼容优先）' : next.toUpperCase()}，下次在线播放生效`);
+    }
+  };
+
   function reconnectOnce() {
     const key = `${activeSeriesId}:${currentIndex}`;
     if (!current?.vid || current.locked || reconnectAttemptRef.current === key) return false;
@@ -667,6 +751,8 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     startOnlinePlay(currentIndex, currentPosition(), true, loadedMediaRef.current ? !loadedMediaRef.current.element.paused : pendingAutoplayRef.current);
     return true;
   }
+
+  reconnectRef.current = reconnectOnce;
 
   // 切集
   const goToEpisode = useCallback(
@@ -725,12 +811,12 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
     const video = event.currentTarget;
     const media = loadedMediaRef.current;
     if (!cacheNext || !canPlay || video.paused || !media?.played || media.version !== mediaVersion.current
-      || media.element !== video || (video.currentSrc && video.currentSrc !== videoSrc)) return;
+      || media.element !== video || (video.currentSrc && video.currentSrc !== videoSrc && !hlsActiveRef.current)) return;
     const next = findNext(currentIndex);
     if (!next?.vid || (next.status === 'completed' && next.fileUrl) || prefetchRef.current) return;
-    const request = { requestId: crypto.randomUUID(), vid: next.vid, seriesId: activeSeriesId, vidIndex: next.vid_index };
+    const request = { requestId: crypto.randomUUID(), vid: next.vid, seriesId: activeSeriesId, vidIndex: next.vid_index, quality: playQualityRef.current };
     prefetchRef.current = request;
-    request.promise = window.electronAPI.prepareOnlinePlay({ ...request, prefetch: true })
+    request.promise = window.electronAPI.prepareOnlinePlay({ requestId: request.requestId, vid: request.vid, seriesId: request.seriesId, vidIndex: request.vidIndex, quality: request.quality, prefetch: true })
       .catch(error => ({ success: false, error: error.message }))
       .then(result => {
         if (prefetchRef.current !== request && onlineRequestRef.current !== request) {
@@ -787,7 +873,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
   const handleMetadata = (event) => {
     const v = event.currentTarget;
     if (!canPlay || playbackVersion !== mediaVersion.current || v !== videoRef.current || !current || current.locked) return;
-    if (v.currentSrc && v.currentSrc !== videoSrc) return;
+    if (v.currentSrc && v.currentSrc !== videoSrc && !hlsActiveRef.current) return;
     loadedMediaRef.current = { element: v, seriesId: activeSeriesId, vidIndex: currentIndex, version: mediaVersion.current, played: false };
     v.defaultPlaybackRate = playbackRateRef.current;
     v.playbackRate = playbackRateRef.current;
@@ -1143,6 +1229,17 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
               <option value="720p">720P</option>
             </select>
           </label>
+          <label className="player-download-quality">
+            <span>播放清晰度</span>
+            <select className="input-field" value={playQuality} disabled={qualityLoading}
+              aria-describedby="player-play-quality-hint"
+              onChange={(event) => changePlayQuality(event.target.value)}>
+              <option value="auto">自动（兼容优先）</option>
+              <option value="1080p">1080P</option>
+              <option value="720p">720P</option>
+            </select>
+          </label>
+          <p className="player-download-quality-hint" id="player-play-quality-hint">仅影响在线播放；本地文件按文件本身清晰度播放。本集没有所选档位时提示并改用自动档，不会转去下载。{actualQuality && onlineUrl ? `当前片源：${actualQuality}` : ''}</p>
           <button className="btn btn-outline" onClick={downloadMissing} disabled={qualityLoading}>
             <Download size={15} />
             下载未完成集
@@ -1370,7 +1467,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
             onRateChange={(event) => {
               const v = event.currentTarget;
               if (!canPlay || v !== videoRef.current || v.readyState === 0 || loadedMediaRef.current?.version !== mediaVersion.current) return;
-              if (v.currentSrc && v.currentSrc !== videoSrc) return;
+              if (v.currentSrc && v.currentSrc !== videoSrc && !hlsActiveRef.current) return;
               if (v.playbackRate !== playbackRateRef.current) changePlaybackRate(v.playbackRate);
             }}
             onEnded={() => { if (canPlay && playbackVersion === mediaVersion.current && (!videoRef.current || loadedMediaRef.current?.version === mediaVersion.current)) handleEnded(); }}
@@ -1379,9 +1476,10 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
             onWaiting={() => { if (canPlay && playbackVersion === mediaVersion.current) setMediaBuffering(true); }}
             onCanPlay={() => { if (canPlay && playbackVersion === mediaVersion.current) setMediaBuffering(false); }}
             onError={(event) => {
+              if (hlsActiveRef.current) return; // HLS 错误由 hls.js 的恢复/重连处理
               if (!canPlay || compatRequestRef.current || playbackVersion !== mediaVersion.current) return;
               if (videoRef.current && event.currentTarget !== videoRef.current) return;
-              if (event.currentTarget.currentSrc && event.currentTarget.currentSrc !== videoSrc) return;
+              if (event.currentTarget.currentSrc && event.currentTarget.currentSrc !== videoSrc && !hlsActiveRef.current) return;
               const errorCode = event.currentTarget.error?.code;
               // Chromium also reports an unavailable HTTP stream as unsupported source (4).
               const unavailableOnline = errorCode === 4 && videoSrc === onlineUrl;
@@ -1389,7 +1487,7 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
               const failedDecode = [3, 4].includes(errorCode);
               if (!failedDecode && errorCode === 2 && reconnectOnce()) return;
               if (isOnlinePlaying && (errorCode === 2 || unavailableOnline)) {
-                recoverOnlineFailure(current, '在线播放失败，正在尝试本地文件或下载');
+                recoverOnlineFailure(current, '在线播放失败');
                 return;
               }
               if (!failedDecode) {
@@ -1405,7 +1503,8 @@ function Player({ target, onNavigate, onSeriesSelected, active = true, portrait 
         <VideoEnhancement videoRef={videoRef} source={videoSrc} available={canPlay && active} enhancement={enhancement} />
         <CommentDanmaku videoRef={videoRef} source={videoSrc} available={canPlay && active} danmaku={danmaku} />
         <PlayerControls danmaku={showDanmakuControls ? danmaku : null} enhancement={enhancement} continuing={autoAdvancing && !playbackError && !decodeFailed} autoContinue={autoNext && !!findNext(currentIndex)} shortcuts={shortcuts} onToggleFullscreen={toggleFullscreen} portrait={portrait} windowFill={windowFill} onWindowFill={setWindowFill} videoRef={videoRef} stageRef={stageRef} source={videoSrc} available={canPlay}
-          pictureMode={pictureMode} onPictureModeChange={changePictureMode} rate={playbackRate} onRateChange={changePlaybackRate} onError={showToast} />
+          pictureMode={pictureMode} onPictureModeChange={changePictureMode} rate={playbackRate} onRateChange={changePlaybackRate} onError={showToast}
+          playQuality={playQuality} actualQuality={actualQuality} onPlayQualityChange={changePlayQuality} />
         {!canPlay && (
           <div className="player-placeholder" style={{ position: 'absolute', inset: 0 }}>
             {playbackError ? (
