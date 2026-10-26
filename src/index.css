@@ -176,3 +176,8 @@ h2, .browse-title h2, .hero-text h2, .settings-header h2, .dm-title h2, .player-
 .layout-portrait .toolbar-actions .btn { flex-shrink: 0; }
 .layout-portrait .toolbar-actions .pin-toggle { width: 30px; padding-inline: 5px; }
 .toolbar-actions .portrait-episodes-toggle[aria-expanded="true"] { background: var(--accent-soft); color: var(--accent-text); }
+
+/* 大屏模式（TV 试点）：整体放大 + 醒目焦点框，配合方向键导航 */
+html.tv-mode #root { zoom: 1.28; }
+html.tv-mode :focus-visible { outline: 3px solid #c8433c; outline-offset: 2px; border-radius: 6px; }
+html.tv-mode .window-toolbar { -webkit-app-region: no-drag; }

@@ -34,10 +34,44 @@ export default function App() {
   const [borderless, setBorderless] = useState(false);
   const [episodesOpen, setEpisodesOpen] = useState(false);
   const [alwaysOnTop, setAlwaysOnTop] = useState(false);
+  const [tvMode, setTvMode] = useState(() => { try { return localStorage.getItem('hg-tv-mode') === '1'; } catch { return false; } });
   const [pinBusy, setPinBusy] = useState(false);
   const layoutLock = useRef(false);
+  // 大屏模式（TV 试点）：全屏 + 界面放大 + 方向键焦点导航，方便接电视/遥控器/远距离操作
+  useEffect(() => {
+    document.documentElement.classList.toggle('tv-mode', tvMode);
+    try { localStorage.setItem('hg-tv-mode', tvMode ? '1' : '0'); } catch { /* 隐私模式忽略 */ }
+  }, [tvMode]);
+  const toggleTvMode = async () => {
+    const next = !tvMode;
+    setTvMode(next);
+    try {
+      if (next) await document.documentElement.requestFullscreen();
+      else if (document.fullscreenElement) await document.exitFullscreen();
+    } catch { /* 全屏被拒不影响放大与方向键导航 */ }
+  };
+
   const [page, setPage] = useState('browse');
   const [visited, setVisited] = useState(['browse']);
+  useEffect(() => {
+    if (!tvMode || page === 'player') return undefined;
+    const onKey = (event) => {
+      if (!['ArrowRight', 'ArrowLeft', 'ArrowDown', 'ArrowUp'].includes(event.key)) return;
+      const target = event.target;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT' || target.isContentEditable)) return;
+      const items = [...document.querySelectorAll('.main-wrapper button:not([disabled]), .main-wrapper a[href], .main-wrapper input, .sidebar button:not([disabled])')]
+        .filter((el) => el.offsetParent !== null);
+      if (!items.length) return;
+      event.preventDefault();
+      const idx = items.indexOf(document.activeElement);
+      const forward = event.key === 'ArrowRight' || event.key === 'ArrowDown';
+      const next = idx === -1 ? items[0] : items[(idx + (forward ? 1 : -1) + items.length) % items.length];
+      next?.focus();
+      next?.scrollIntoView?.({ block: 'nearest' });
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [tvMode, page]);
   const [storageError, setStorageError] = useState('');
   const [appInfo, setAppInfo] = useState(null); // { version, brand, appName }
   const [playerMounted, setPlayerMounted] = useState(false);
@@ -171,6 +205,8 @@ export default function App() {
               }}>{actionsHidden || borderless && layout === 'portrait' ? '显示按钮' : '隐藏按钮'}</button>}
             {page === 'player' && layout === 'portrait' && <button className="btn btn-outline btn-sm borderless-toggle" aria-pressed={borderless}
               onClick={() => setBorderless(value => !value)}>{borderless ? '恢复边框' : '去掉边框'}</button>}
+            <button className="btn btn-outline btn-sm tv-toggle" aria-pressed={tvMode} onClick={toggleTvMode}
+              title="大屏模式：全屏并放大界面，方向键移动焦点、回车确认（适合接电视或远距离操作）">{tvMode ? '退出大屏' : '大屏模式'}</button>
             <button className="btn btn-outline btn-sm pin-toggle" aria-pressed={alwaysOnTop} disabled={pinBusy}
               aria-label={alwaysOnTop ? '取消置顶' : '置顶'} title={alwaysOnTop ? '取消置顶' : '置顶'}
               onClick={async () => {
