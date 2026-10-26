@@ -264,7 +264,7 @@ async function fetchAppPlayUrl(vid, options = {}) {
         : Math.min(a.width, a.height) - Math.min(b.width, b.height) || a.codecRank - b.codecRank);
     if (!rows.length) throw new Error(requestedQuality === 'auto'
         ? '本集暂未提供兼容的 H.264/HEVC 片源'
-        : `本集暂无尺寸可确认且满足 ${requestedQuality} 的 H.264/HEVC 片源，未降级下载`);
+        : `本集暂无尺寸可确认且满足 ${requestedQuality} 的 H.264/HEVC 片源，未自动降级`);
     let lastError;
     const variants = [];
     const seen = new Set();
